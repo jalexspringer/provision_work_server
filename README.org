@@ -1,0 +1,442 @@
+#+TITLE:  devserver
+* Digital Ocean Dev Server Auto-Generate
+Creating a clean and secure dev environment on the fly with Terraform and
+Ansible.
+** Provision - Terraform
+:PROPERTIES:
+:header-args: :tangle main.tf
+:END:
+Creating the droplet in the first place. Note that details of images, sizes and
+regions are here and up to date as of Pi Day 2019: [[file:do_deets/][file:~/Dropbox/projects/devserve/do_deets/]
+#+BEGIN_SRC bash
+provider "digitalocean" {
+  token = "${var.do_api_token}"
+}
+
+resource "digitalocean_droplet" "dev_server" {
+  name = "${var.server_name}"
+  image = "${var.image}"
+  size = "${var.server_size}"
+  region = "${var.region}"
+  ipv6 = true
+  private_networking = false
+  tags = ["${digitalocean_tag.dev.name}"]
+  ssh_keys = ["${var.ssh_key_hash}"]
+  provisioner "local-exec" {
+    command = <<EOD
+cat <<EOF > hosts
+[dev]
+${digitalocean_droplet.dev_server.ipv4_address}
+[dev:vars]
+server=${var.server_name}
+ansible_python_interpreter=/usr/bin/python3
+EOF
+EOD
+  }
+   provisioner "local-exec" {
+        command = "sleep 60 && ansible-playbook -i hosts gofish.yml"
+   }
+}
+
+resource "digitalocean_tag" "dev" {
+  name = "dev"
+}
+#+END_SRC
+
+Setting up subdomain for ease of pointing and shooting.
+#+BEGIN_SRC bash
+resource "digitalocean_domain" "atcloudbase" {
+  name = "${var.dev_domain}"
+  ip_address = "${digitalocean_droplet.dev_server.ipv4_address}"
+}
+
+resource "digitalocean_record" "atcloudbase" {
+  name = "${var.server_name}"
+  type = "A"
+  domain = "${digitalocean_domain.atcloudbase.name}"
+  value = "${digitalocean_droplet.dev_server.ipv4_address}"
+}
+#+END_SRC
+
+And firewall that lets me in from wherever I just set this up. And nowhere else.
+#+BEGIN_SRC bash
+resource "digitalocean_firewall" "dev" {
+  name = "only-ssh"
+  droplet_ids = ["${digitalocean_droplet.dev_server.id}"]
+  inbound_rule = [
+    {
+      protocol = "tcp"
+      port_range = "22"
+      source_addresses = ["${chomp(data.http.myip.body)}/32"]
+    },
+    {
+      protocol = "udp"
+      port_range = "60001"
+      source_addresses = ["${chomp(data.http.myip.body)}/32"]
+    },
+    {
+      protocol = "tcp"
+      port_range = "80"
+      source_addresses = ["0.0.0.0/0"]
+    }
+  ]
+}
+
+data "http" "myip" {
+  url = "http://ipv4.icanhazip.com"
+}
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle outputs.tf
+output "instance_ip_addr" {
+  value = "${digitalocean_droplet.dev_server.ipv4_address}"
+}
+#+END_SRC
+
+#+BEGIN_SRC bash :results silent :tangle no
+terraform fmt
+#+END_SRC
+** Configure - Ansible
+:PROPERTIES:
+:header-args: :tangle gofish.yml
+:END:
+
+Starting with updates and standard package install.
+#+BEGIN_SRC yaml
+- hosts: dev
+  become: yes
+  remote_user: root
+  tasks:
+  - name: install system updates for centos systems
+    yum: name=* state=latest update_cache=yes
+    when: ansible_distribution == "CentOS"
+
+  - name: install system updates for ubuntu systems
+    apt: upgrade=dist update_cache=yes
+    when: ansible_distribution == "Ubuntu"
+
+  - name: install basic packages
+    action: >
+      {{ ansible_pkg_mgr }} name={{ item }} state=present update_cache=yes
+    with_items:
+      - vim
+      - tmux
+      - mosh
+      - tmate
+      - git
+      - python3
+      - python3-pip
+      - zsh
+      - fonts-powerline
+#+END_SRC
+
+
+I exist!
+#+BEGIN_SRC yaml
+  - name: "Create user accounts and add users to groups"
+    user:
+      name: "alexs"
+      groups: "admin,docker"
+      shell: "/bin/zsh"
+  - name: "Add authorized keys"
+    authorized_key:
+      user: "alexs"
+      key: "{{ lookup('file', 'keys/cloudbase.pub') }}"
+  - name: "Allow admin users to sudo without a password"
+    lineinfile:
+      path: "/etc/sudoers" # path: in version 2.3
+      state: "present"
+      regexp: "^%admin"
+      line: "%admin ALL=(ALL) NOPASSWD: ALL"
+
+  - name: Enable moshing
+    shell: "ufw allow 60000:61000/udp"
+#+END_SRC
+
+Dot files deployed
+#+BEGIN_SRC yaml
+  - name: Buy me a spaceship and fly
+    git:
+      repo: https://github.com/denysdovhan/spaceship-prompt.git
+      version: master
+      dest: /home/alexs/.spaceship
+  - name: Create symbolic link
+    file:
+      src: "/home/alexs/.spaceship/spaceship.zsh"
+      dest: "/usr/local/share/zsh/site-functions/prompt_spaceship_setup"
+      state: link
+
+  - name: Update .zshrc
+    copy:
+      src: "./dots/.zshrc"
+      dest: "/home/alexs/.zshrc"
+      become: yes
+      become_user: alexs
+
+  - name: Tmux config
+    copy:
+      src: "./dots/.tmux.conf"
+      dest: "/home/alexs/.tmux.conf"
+      become: yes
+      become_user: alexs
+#+END_SRC
+
+Download Doom Config
+#+BEGIN_SRC yaml
+  - name: Download Doom.d config
+    git:
+      repo: https://github.com/jalexspringer/doom-private-config.git
+      version: master
+      dest: /home/alexs/,doom.d
+      become: yes
+      become_user: alexs
+#+END_SRC
+
+
+Serving the freshest web
+#+BEGIN_SRC yaml
+  - name: ensure nginx is at the latest version
+    apt: name=nginx state=latest
+  - name: start nginx
+    service:
+        name: nginx
+        state: started
+#+END_SRC
+
+EMACS!
+#+BEGIN_SRC yaml :tangle no
+- name: resolve platform specific vars
+  include_vars: '{{item}}'
+  with_first_found:
+    - files:
+        - '{{ansible_distribution}}-{{ansible_distribution_release}}.yml'
+        - '{{ansible_distribution}}.yml'
+        - '{{ansible_os_family}}.yml'
+      skip: true
+      paths:
+        - '{{role_path}}/vars'
+
+- name: os pkgs....
+  become: yes
+  become_user: root
+  with_items: '{{emacs_build_os_pkgs|default([])}}'
+  package:
+    name: '{{item}}'
+    state: present
+
+- name: downloading...
+  become: yes
+  become_user: root
+  get_url:
+    url: '{{emacs_build_url}}'
+    dest: /tmp/{{emacs_build_tgz}}
+    timeout: '{{emacs_build_timeout_seconds}}'
+    mode: 0644
+
+- name: unarchiving...
+  become: yes
+  become_user: root
+  unarchive:
+    remote_src: yes
+    src: /tmp/{{emacs_build_tgz}}
+    dest: '{{emacs_build_parent_src_dir}}'
+    creates: '{{emacs_build_src_dir}}'
+
+- name: configuring...
+  become: yes
+  become_user: root
+  command: ./configure --with-x=no
+  args:
+    chdir: '{{emacs_build_src_dir}}'
+    creates: '{{emacs_build_src_dir}}/Makefile'
+
+- name: building...
+  become: yes
+  become_user: root
+  command: make
+  args:
+    chdir: '{{emacs_build_src_dir}}'
+    creates: '{{emacs_build_src_dir}}/src/emacs'
+
+- name: installing...
+  become: yes
+  become_user: root
+  command: make install
+  args:
+    chdir: '{{emacs_build_src_dir}}'
+    creates: /usr/local/bin/emacs
+
+- name: cleanup...
+  become: yes
+  become_user: root
+  file:
+    path: '{{emacs_build_src_dir}}'
+    state: absent
+#+END_SRC
+
+Getting tricky and auto-configing AWS CLI based on current creds.
+#+BEGIN_SRC yaml
+  - name: Install AWS command line interface
+    sudo: yes
+    pip:
+      name: "awscli"
+      version: "1.7.39"
+
+# - name: Create .aws directory in the home directory
+#   file:
+#     path: "/home/{{ansible_ssh_user}}/.aws/"
+#     state: directory
+#     owner: "{{ansible_ssh_user}}"
+#     group: "{{ansible_ssh_user}}"
+#     mode: 0755
+
+# - name: Copy the aws config file to the box
+#   sudo: yes
+#   template:
+#     src: ../templates/aws_config.j2
+#     dest: "/home/alexs/.aws/config"
+#     owner: "{{ansible_ssh_user}}"
+#     group: "{{ansible_ssh_user}}"
+#     mode: 0600
+#+END_SRC
+**
+** Dynamic Values
+*** Region
+*** Use Case
+- Development
+- Web server
+- DB
+** Additional Files
+Tmux Config
+#+BEGIN_SRC bash :tangle dots/.tmux.conf
+# Tmux settings
+
+# Reload the config
+bind r source-file ~/.tmux.conf \; display "Reloaded!"
+
+# Set change prefix key
+set -g prefix C-a
+bind C-a send-prefix
+unbind C-b
+
+# Window splitting
+bind | split-window -h
+bind - split-window -v
+
+# Don't mess with my emacs
+set -sg escape-time 1
+
+# Set colors
+set-option -g default-terminal "screen-256color"
+
+# Set reload key to r
+bind r source-file ~/.tmux.conf
+
+# Count start at 1
+set -g base-index 1
+setw -g pane-base-index 1
+
+# Use vim bindings
+setw -g mode-keys vi
+
+# Remap window navigation to vim
+unbind-key j
+bind-key j select-pane -D
+unbind-key k
+bind-key k select-pane -U
+unbind-key h
+bind-key h select-pane -L
+unbind-key l
+bind-key l select-pane -R
+
+bind -r H resize-pane -L 5
+bind -r J resize-pane -D 5
+bind -r K resize-pane -U 5
+bind -r L resize-pane -R 5
+
+# Set the title bar
+set -g set-titles on
+set -g set-titles-string '#(whoami) :: #h :: #(curl ipecho.net/plain;echo)'
+
+# colors!
+set -g default-terminal "screen-256color"
+
+# Set status bar
+# set -g status-utf8 on
+set -g status-bg black
+set -g status-fg white
+set -g status-interval 5
+set -g status-left-length 90
+set -g status-right-length 60
+set -g status-left "#[fg=Green]#(whoami)#[fg=white]::#[fg=Green]#(hostname -s)#[fg=white]::#[fg=yellow]#(curl ipecho.net/plain;echo)"
+set -g status-right 'Session: #[fg=Cyan]#S #[fg=white]%a %d %b %R'
+set -g status-justify centre
+
+set -g message-fg white
+set -g message-bg black
+set -g message-attr bright
+
+# notify me of things
+setw -g monitor-activity on
+set -g visual-activity on
+
+#+END_SRC
+
+ZSH Config
+#+BEGIN_SRC bash :tangle dots/.zshrc
+# Set up the prompt
+autoload -U promptinit; promptinit
+prompt spaceship
+
+setopt histignorealldups sharehistory
+
+# Use emacs keybindings even if our EDITOR is set to vi
+bindkey -e
+
+# Keep 1000 lines of history within the shell and save it to ~/.zsh_history:
+HISTSIZE=1000
+SAVEHIST=1000
+HISTFILE=~/.zsh_history
+
+# Use modern completion system
+autoload -Uz compinit
+compinit
+
+zstyle ':completion:*' auto-description 'specify: %d'
+zstyle ':completion:*' completer _expand _complete _correct _approximate
+zstyle ':completion:*' format 'Completing %d'
+zstyle ':completion:*' group-name ''
+zstyle ':completion:*' menu select=2
+eval "$(dircolors -b)"
+zstyle ':completion:*:default' list-colors ${(s.:.)LS_COLORS}
+zstyle ':completion:*' list-colors ''
+zstyle ':completion:*' list-prompt %SAt %p: Hit TAB for more, or the character to insert%s
+zstyle ':completion:*' matcher-list '' 'm:{a-z}={A-Z}' 'm:{a-zA-Z}={A-Za-z}' 'r:|[._-]=* r:|=* l:|=*'
+zstyle ':completion:*' menu select=long
+zstyle ':completion:*' select-prompt %SScrolling active: current selection at %p%s
+zstyle ':completion:*' use-compctl false
+zstyle ':completion:*' verbose true
+
+zstyle ':completion:*:*:kill:*:processes' list-colors '=(#b) #([0-9]#)*=0=01;31'
+zstyle ':completion:*:kill:*' command 'ps -u $USER -o pid,%cpu,tty,cputime,cmd'
+# Emacs tramp fix
+if [[ "$TERM" == "dumb" ]]
+then
+  unsetopt zle
+  unsetopt prompt_cr
+  unsetopt prompt_subst
+  unfunction precmd
+  unfunction preexec
+  PS1='$ '
+fi
+#+END_SRC
+** Automated Launch
+One script to run them all
+#+BEGIN_SRC bash :tangle launch.sh
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/cloudbase
+terraform plan -out="terraform.plan" && terraform apply "terraform.plan"
+emacs "/ssh:alexs@`terraform output instance_ip_addr`:/home/alexs" &
+mosh "alexs@`terraform output instance_ip_addr`"
+eval "$(ssh-agent -k)"
+#+END_SRC

@@ -1,0 +1,5 @@
+[dev]
+157.230.234.183
+[dev:vars]
+server=moby
+ansible_python_interpreter=/usr/bin/python3

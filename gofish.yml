@@ -1,0 +1,107 @@
+- hosts: dev
+  become: yes
+  remote_user: root
+  tasks:
+  - name: install system updates for centos systems
+    yum: name=* state=latest update_cache=yes
+    when: ansible_distribution == "CentOS"
+
+  - name: install system updates for ubuntu systems
+    apt: upgrade=dist update_cache=yes
+    when: ansible_distribution == "Ubuntu"
+
+  - name: install basic packages
+    action: >
+      {{ ansible_pkg_mgr }} name={{ item }} state=present update_cache=yes
+    with_items:
+      - vim
+      - tmux
+      - mosh
+      - tmate
+      - git
+      - python3
+      - python3-pip
+      - zsh
+      - fonts-powerline
+
+  - name: "Create user accounts and add users to groups"
+    user:
+      name: "alexs"
+      groups: "admin,docker"
+      shell: "/bin/zsh"
+  - name: "Add authorized keys"
+    authorized_key:
+      user: "alexs"
+      key: "{{ lookup('file', 'keys/cloudbase.pub') }}"
+  - name: "Allow admin users to sudo without a password"
+    lineinfile:
+      path: "/etc/sudoers" # path: in version 2.3
+      state: "present"
+      regexp: "^%admin"
+      line: "%admin ALL=(ALL) NOPASSWD: ALL"
+
+  - name: Enable moshing
+    shell: "ufw allow 60000:61000/udp"
+
+  - name: Buy me a spaceship and fly
+    git:
+      repo: https://github.com/denysdovhan/spaceship-prompt.git
+      version: master
+      dest: /home/alexs/.spaceship
+  - name: Create symbolic link
+    file:
+      src: "/home/alexs/.spaceship/spaceship.zsh"
+      dest: "/usr/local/share/zsh/site-functions/prompt_spaceship_setup"
+      state: link
+
+  - name: Update .zshrc
+    copy:
+      src: "./dots/.zshrc"
+      dest: "/home/alexs/.zshrc"
+      become: yes
+      become_user: alexs
+
+  - name: Tmux config
+    copy:
+      src: "./dots/.tmux.conf"
+      dest: "/home/alexs/.tmux.conf"
+      become: yes
+      become_user: alexs
+
+  - name: Download Doom.d config
+    git:
+      repo: https://github.com/jalexspringer/doom-private-config.git
+      version: master
+      dest: /home/alexs/,doom.d
+      become: yes
+      become_user: alexs
+
+  - name: ensure nginx is at the latest version
+    apt: name=nginx state=latest
+  - name: start nginx
+    service:
+        name: nginx
+        state: started
+
+  - name: Install AWS command line interface
+    sudo: yes
+    pip:
+      name: "awscli"
+      version: "1.7.39"
+
+# - name: Create .aws directory in the home directory
+#   file:
+#     path: "/home/{{ansible_ssh_user}}/.aws/"
+#     state: directory
+#     owner: "{{ansible_ssh_user}}"
+#     group: "{{ansible_ssh_user}}"
+#     mode: 0755
+
+# - name: Copy the aws config file to the box
+#   sudo: yes
+#   template:
+#     src: ../templates/aws_config.j2
+#     dest: "/home/alexs/.aws/config"
+#     owner: "{{ansible_ssh_user}}"
+#     group: "{{ansible_ssh_user}}"
+#     mode: 0600
